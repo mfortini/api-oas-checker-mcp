@@ -12,9 +12,12 @@ It wraps the [api-oas-checker](https://github.com/italia/api-oas-checker-rules) 
 
 - **Validate OpenAPI Files**: Check local OpenAPI files against Italian PA rules.
 - **Validate Content**: Paste OpenAPI content directly for validation.
+- **Multiple Rulesets**: Choose from 4 standard Italian PA rulesets (`spectral`, `spectral-full`, `spectral-generic`, `spectral-security`) or use a custom one.
+- **List Rules**: Inspect the available rules in any ruleset.
 - **Smart Filtering**:
   - Filter by Line Numbers (`line_start`, `line_end`)
   - Filter by JSON Path (`filter_path`, e.g., `paths./users`)
+  - Filter by Rule Codes (`allowed_rules`)
 - **Token Efficient**: Summarized output design to save context window tokens.
 
 ## Installation
@@ -43,11 +46,11 @@ Or add it to your configuration (see Configuration section).
 git clone https://github.com/mfortini/api-oas-checker-mcp.git
 cd api-oas-checker-mcp
 npm install
-npm run build
 ```
 
+The `prepare` script automatically compiles TypeScript during `npm install`.
+
 **Verify Build**:
-Ensure `build/index.js` exists.
 ```bash
 node build/index.js
 ```
@@ -115,6 +118,9 @@ Validates an OpenAPI document.
 **Arguments:**
 - `openapi_path` (string, optional): Absolute path to the file.
 - `openapi_content` (string, optional): Raw string content of the OpenAPI file.
+- `standard_ruleset` (string, optional): One of `spectral`, `spectral-full`, `spectral-generic`, `spectral-security`. Default: `spectral`.
+- `ruleset_path` (string, optional): URL or local path to a custom Spectral ruleset file.
+- `allowed_rules` (string[], optional): List of rule codes to check. If omitted, all rules are checked.
 - `filter_path` (string, optional): Filter issues containing this string in their path (e.g., `info.version`).
 - `line_start` (number, optional): Show issues starting from this line.
 - `line_end` (number, optional): Show issues ending at this line.
@@ -122,6 +128,13 @@ Validates an OpenAPI document.
 
 **Example Prompt:**
 > "Check the file /home/user/my-api.yaml for errors, focusing on the '/users' path."
+
+#### `list_rules`
+Lists the available rules from a Spectral ruleset.
+
+**Arguments:**
+- `standard_ruleset` (string, optional): One of `spectral`, `spectral-full`, `spectral-generic`, `spectral-security`. Default: `spectral`.
+- `ruleset_path` (string, optional): URL or local path to a custom Spectral ruleset file.
 
 ## Development
 
