@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test MCP initialize
+        run: |
+          RESPONSE=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}' | node build/index.js 2>/dev/null | head -1)
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['result']['serverInfo']['name'] == 'api-oas-checker', 'Wrong server name'
+          assert data['result']['serverInfo']['version'] == '1.0.0', 'Wrong version'
+          print('Initialize OK')
+          "
+
+      - name: Test MCP tools/list
+        run: |
+          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | node build/index.js 2>/dev/null | tail -1)
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          tools = {t['name'] for t in data['result']['tools']}
+          assert 'validate_openapi' in tools, 'Missing validate_openapi tool'
+          assert 'list_rules' in tools, 'Missing list_rules tool'
+          print('Tools list OK: ' + ', '.join(sorted(tools)))
+          "
+
+      - name: Test validate_openapi
+        run: |
+          cat > /tmp/test-api.yaml << 'SPEC'
+          openapi: 3.0.3
+          info:
+            title: Test API
+            version: 1.0.0
+          paths:
+            /users:
+              get:
+                summary: Get users
+                responses:
+                  '200':
+                    description: OK
+          SPEC
+          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"validate_openapi","arguments":{"openapi_path":"/tmp/test-api.yaml","max_issues":5}}}\n' | node build/index.js 2>/dev/null | tail -1)
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          text = data['result']['content'][0]['text']
+          assert 'issues' in text.lower(), 'Expected issues in output'
+          print('Validate OK')
+          print(text[:200])
+          "
+
+      - name: Test list_rules
+        run: |
+          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_rules","arguments":{"standard_ruleset":"spectral"}}}\n' | node build/index.js 2>/dev/null | tail -1)
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          rules = json.loads(data['result']['content'][0]['text'])
+          assert len(rules) > 0, 'Expected at least one rule'
+          print(f'List rules OK: {len(rules)} rules found')
+          "
