@@ -9,16 +9,26 @@ import {
     McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { exec } from "child_process";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import util from "util";
+import crypto from "crypto";
 import yaml from "js-yaml";
+import { fileURLToPath } from "url";
 
-const execPromise = util.promisify(exec);
-const writeFilePromise = util.promisify(fs.writeFile);
-const unlinkPromise = util.promisify(fs.unlink);
+const execFilePromise = promisify(execFile);
+
+const DEBUG = !!process.env.MCP_DEBUG;
+function debug(msg: string) {
+    if (DEBUG) console.error(`[DEBUG] ${msg}`);
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SPECTRAL_BIN = path.resolve(__dirname, "..", "node_modules", ".bin", "spectral");
 
 const server = new Server(
     {
@@ -62,70 +72,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "validate_openapi",
                 description: "Validate an OpenAPI specification using Italian PA guidelines (Spectral).",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        openapi_path: {
-                            type: "string",
-                            description: "Absolute path to the OpenAPI file.",
-                        },
-                        openapi_content: {
-                            type: "string",
-                            description: "Content of the OpenAPI file (if not providing path).",
-                        },
-                        filter_path: {
-                            type: "string",
-                            description: "Filter issues by JSON path prefix (e.g. 'paths./users').",
-                        },
-                        line_start: {
-                            type: "number",
-                            description: "Start line number for filtering (inclusive).",
-                        },
-                        line_end: {
-                            type: "number",
-                            description: "End line number for filtering (inclusive).",
-                        },
-                        max_issues: {
-                            type: "number",
-                            description: "Maximum number of issues to return. Default is 20.",
-                            default: 20,
-                        },
-                        ruleset_path: {
-                            type: "string",
-                            description: "URL or local path to a custom spectral ruleset file.",
-                        },
-                        standard_ruleset: {
-                            type: "string",
-                            enum: ["spectral", "spectral-full", "spectral-generic", "spectral-security"],
-                            description: "Use a standard ruleset from the Italian guidelines (default: spectral).",
-                        },
-                        allowed_rules: {
-                            type: "array",
-                            items: {
-                                type: "string",
-                            },
-                            description: "List of rule codes to verify. If omitted, all rules are checked.",
-                        },
-                    },
-                },
+                inputSchema: zodToJsonSchema(ValidateOpenApiSchema),
             },
             {
                 name: "list_rules",
                 description: "List available rules from a Spectral ruleset.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        ruleset_path: {
-                            type: "string",
-                            description: "URL or local path to a spectral ruleset file.",
-                        },
-                        standard_ruleset: {
-                            type: "string",
-                            enum: ["spectral", "spectral-full", "spectral-generic", "spectral-security"],
-                            description: "Use a standard ruleset from the Italian guidelines (default: spectral).",
-                        },
-                    },
-                },
+                inputSchema: zodToJsonSchema(ListRulesSchema),
             },
         ],
     };
@@ -216,12 +168,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
         if (openapi_content) {
             const tempDir = os.tmpdir();
-            const tempFile = path.join(tempDir, `temp_openapi_${Date.now()}.yaml`); // Assume yaml by default if content
-            await writeFilePromise(tempFile, openapi_content);
+            const tempFile = path.join(tempDir, `temp_openapi_${crypto.randomUUID()}.yaml`);
+            await fs.promises.writeFile(tempFile, openapi_content);
             filePathToLint = tempFile;
             cleanUpFile = true;
         } else if (!filePathToLint) {
-            // Should be covered by the check above, but for types
             throw new Error("Unexpected state");
         }
 
@@ -237,62 +188,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // The release/download content expects functions/checkSecurity.js relative path, but it's not in the release.
         // We download the ruleset and the function locally to make it work.
         if (rulesetUrl === STANDARD_RULESETS["spectral-security"] || rulesetUrl === STANDARD_RULESETS["spectral-full"]) {
-            console.error(`[DEBUG] Fix ruleset for ${standard_ruleset}`);
+            debug(`Fix ruleset for ${standard_ruleset}`);
             const cacheDir = path.join(os.tmpdir(), "mcp-api-oas-checker-cache");
             if (!fs.existsSync(cacheDir)) {
-                await fs.promises.mkdir(cacheDir, { recursive: true });
+                await fs.promises.mkdir(cacheDir, { recursive: true, mode: 0o700 });
             }
             if (!fs.existsSync(path.join(cacheDir, "functions"))) {
-                await fs.promises.mkdir(path.join(cacheDir, "functions"), { recursive: true });
+                await fs.promises.mkdir(path.join(cacheDir, "functions"), { recursive: true, mode: 0o700 });
             }
 
             const ruleFilename = path.basename(rulesetUrl);
             const localRulesetPath = path.join(cacheDir, ruleFilename);
             const localFunctionPath = path.join(cacheDir, "functions", "checkSecurity.js");
 
-            console.error(`[DEBUG] Downloading ruleset from ${rulesetUrl} to ${localRulesetPath}`);
             if (!fs.existsSync(localRulesetPath)) {
+                debug(`Downloading ruleset from ${rulesetUrl} to ${localRulesetPath}`);
                 const rulesetResp = await fetch(rulesetUrl);
                 if (!rulesetResp.ok) throw new Error(`Failed to download ruleset: ${rulesetResp.statusText}`);
                 const rulesetContent = await rulesetResp.text();
-                await writeFilePromise(localRulesetPath, rulesetContent);
+                await fs.promises.writeFile(localRulesetPath, rulesetContent);
             } else {
-                console.error(`[DEBUG] Using cached ruleset at ${localRulesetPath}`);
+                debug(`Using cached ruleset at ${localRulesetPath}`);
             }
 
-            console.error(`[DEBUG] Downloading checkSecurity.js to ${localFunctionPath}`);
             if (!fs.existsSync(localFunctionPath)) {
+                debug(`Downloading checkSecurity.js to ${localFunctionPath}`);
                 const functionUrl = "https://raw.githubusercontent.com/italia/api-oas-checker-rules/refs/heads/main/security/functions/checkSecurity.js";
                 const funcResp = await fetch(functionUrl);
                 if (!funcResp.ok) throw new Error(`Failed to download checkSecurity.js: ${funcResp.statusText}`);
                 const funcContent = await funcResp.text();
-                await writeFilePromise(localFunctionPath, funcContent);
+                await fs.promises.writeFile(localFunctionPath, funcContent);
             } else {
-                console.error(`[DEBUG] Using cached checkSecurity.js`);
+                debug(`Using cached checkSecurity.js`);
             }
 
             rulesetUrl = localRulesetPath;
-            console.error(`[DEBUG] Ruleset fixed at ${rulesetUrl}`);
+            debug(`Ruleset fixed at ${rulesetUrl}`);
         }
 
-        // Run Spectral
-        // We explicitly call the spectral binary found in node_modules or global.
-        // Since we installed @stoplight/spectral-cli, it should be in npx or node_modules/.bin/spectral
-        // We will use `npx spectral lint` to be safe, or direct path.
-        console.error(`[DEBUG] Running Spectral on ${filePathToLint} with ruleset ${rulesetUrl}`);
-        const command = `npx spectral lint "${filePathToLint}" -r "${rulesetUrl}" -f json --quiet`;
+        // Run Spectral via execFile (no shell interpolation — prevents command injection)
+        debug(`Running Spectral on ${filePathToLint} with ruleset ${rulesetUrl}`);
+        const spectralArgs = ["lint", filePathToLint!, "-r", rulesetUrl, "-f", "json", "--quiet"];
 
         let stdout = "";
         try {
-            // Increase buffer size to 10MB to handle large outputs
-            const result = await execPromise(command, { maxBuffer: 1024 * 1024 * 10 });
+            const result = await execFilePromise(SPECTRAL_BIN, spectralArgs, { maxBuffer: 1024 * 1024 * 10 });
             stdout = result.stdout;
         } catch (e: any) {
             // Spectral returns exit code 1 if issues are found, but stdout still contains the JSON
             if (e.stdout) {
                 stdout = e.stdout;
             } else {
-                throw e;
+                throw new Error(`Spectral failed: ${e.stderr || e.message}`);
             }
         }
 
@@ -336,7 +283,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const totalIssues = filteredIssues.length;
         const cappedIssues = filteredIssues.slice(0, max_issues);
 
-
         // Formatting
         const header = `Found ${totalIssues} issues` +
             (totalIssues > max_issues ? ` (showing first ${max_issues})` : "") +
@@ -345,7 +291,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const lines = cappedIssues.map((issue: any) => {
             const line = issue.range.start.line + 1;
             const severity = ["Error", "Warning", "Information", "Hint"][issue.severity] || "Unknown";
-            // Shorten message to save tokens?
             return `Line ${line}: [${severity}] ${issue.message} (${issue.code})`;
         });
 
@@ -373,7 +318,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } finally {
         if (cleanUpFile && filePathToLint) {
             try {
-                await unlinkPromise(filePathToLint);
+                await fs.promises.unlink(filePathToLint);
             } catch (e) {
                 // ignore
             }

@@ -3,3 +3,4 @@ build/
 
 *.tsbuildinfo
 .DS_Store
+usage_log.jsonl

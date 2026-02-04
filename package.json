@@ -1,7 +1,7 @@
 {
   "name": "api-oas-checker-mcp",
   "version": "1.0.0",
-  "description": "",
+  "description": "MCP server for validating OpenAPI specifications against Italian PA guidelines using Spectral",
   "main": "build/index.js",
   "bin": {
     "api-oas-checker-mcp": "./build/index.js"
@@ -12,14 +12,18 @@
     "start": "node build/index.js",
     "prepare": "npm run build"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["mcp", "openapi", "spectral", "italia", "api", "validation", "lint"],
+  "author": "Matteo Fortini",
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.1",
     "@stoplight/spectral-cli": "^6.11.0",
     "js-yaml": "^4.1.1",
-    "zod": "^3.22.4"
+    "zod": "^3.22.4",
+    "zod-to-json-schema": "^3.25.1"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
