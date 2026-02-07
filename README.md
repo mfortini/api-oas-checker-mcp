@@ -57,7 +57,7 @@ node build/index.js
 (It should hang waiting for MCP input, which is normal. Press `Ctrl+C` to exit.)
 
 ## Configuration
-
+/
 ### Claude Desktop
 
 Add the server to your `claude_desktop_config.json`:
