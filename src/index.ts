@@ -90,6 +90,15 @@ const ListRulesSchema = z.object({
         .describe("Standard Italian PA ruleset: 'spectral' (default), 'spectral-full', 'spectral-generic', 'spectral-security'."),
 }).strict();
 
+const GetRuleGuidanceSchema = z.object({
+    ruleset_path: z.string().optional()
+        .describe("URL or absolute local path to a Spectral ruleset file. Overrides standard_ruleset."),
+    standard_ruleset: z.enum(STANDARD_RULESET_NAMES).optional()
+        .describe("Standard Italian PA ruleset: 'spectral' (default), 'spectral-full', 'spectral-generic', 'spectral-security'."),
+    rule_codes: z.array(z.string()).optional()
+        .describe("Optional list of rule codes to fetch full guidance for. If omitted, returns all rules."),
+}).strict();
+
 // --- Shared helpers ---
 
 function resolveRulesetUrl(rulesetPath?: string, standardRuleset?: string): string {
@@ -212,6 +221,72 @@ Error Handling:
             const message = error instanceof Error ? error.message : String(error);
             return {
                 content: [{ type: "text", text: `Error fetching or parsing ruleset: ${message}` }],
+                isError: true,
+            };
+        }
+    }
+);
+
+// --- Tool: get_rule_guidance ---
+
+server.registerTool(
+    "get_rule_guidance",
+    {
+        title: "Get Full Rule Guidance",
+        description: `Return full guidance text (description/message) for selected Spectral rules.
+
+Use this tool when compact validation output is not enough and full rule guidance is needed.
+
+Args:
+  - standard_ruleset (string, optional): One of 'spectral', 'spectral-full', 'spectral-generic', 'spectral-security'. Default: 'spectral'.
+  - ruleset_path (string, optional): URL or local path to a custom ruleset. Overrides standard_ruleset.
+  - rule_codes (string[], optional): Rule codes to return. If omitted, all rules are returned.
+
+Returns:
+  JSON array of objects:
+  [
+    {
+      "code": "cache-responses-undocumented",
+      "severity": "info",
+      "guidance": "Cache usage SHOULD be extensively detailed ..."
+    }
+  ]`,
+        inputSchema: GetRuleGuidanceSchema,
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true,
+        },
+    },
+    async ({ ruleset_path, standard_ruleset, rule_codes }) => {
+        try {
+            const rulesetUrl = resolveRulesetUrl(ruleset_path, standard_ruleset);
+            const rulesContent = await fetchRulesetContent(rulesetUrl);
+            const ruleset = parseRuleset(rulesContent);
+
+            if (!ruleset?.rules) {
+                return {
+                    content: [{ type: "text", text: "No rules found in the provided ruleset." }],
+                };
+            }
+
+            const requestedCodes = rule_codes && rule_codes.length > 0 ? new Set(rule_codes) : null;
+            const guidance = Object.entries(ruleset.rules)
+                .filter(([code]) => !requestedCodes || requestedCodes.has(code))
+                .map(([code, rule]) => ({
+                    code,
+                    severity: rule.severity || "unknown",
+                    guidance: (rule.description || rule.message || "").trim(),
+                }));
+
+            return {
+                content: [{ type: "text", text: JSON.stringify(guidance, null, 2) }],
+            };
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+                content: [{ type: "text", text: `Error fetching guidance: ${message}` }],
                 isError: true,
             };
         }
