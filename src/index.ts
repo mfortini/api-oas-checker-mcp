@@ -19,7 +19,9 @@ function debug(msg: string) {
     if (DEBUG) console.error(`[DEBUG] ${msg}`);
 }
 
-const CHARACTER_LIMIT = 25000;
+const CHARACTER_LIMIT = 12000;
+const MAX_GUIDANCE_CHARS = 220;
+const MAX_LINE_SAMPLES_PER_RULE = 3;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,6 +41,7 @@ const STANDARD_RULESET_NAMES = ["spectral", "spectral-full", "spectral-generic",
 interface SpectralIssue {
     code: string;
     message: string;
+    description?: string;
     path: string[];
     severity: number;
     range: {
@@ -119,6 +122,16 @@ function extractRuleDescriptions(ruleset: RulesetData): Record<string, string> {
         }
     }
     return descriptions;
+}
+
+function normalizeGuidanceText(text?: string): string {
+    if (!text) return "";
+    return text.replace(/\s+/g, " ").trim();
+}
+
+function compactGuidance(text: string): string {
+    if (text.length <= MAX_GUIDANCE_CHARS) return text;
+    return `${text.slice(0, MAX_GUIDANCE_CHARS - 3)}...`;
 }
 
 function truncateIfNeeded(text: string): string {
@@ -377,6 +390,12 @@ Error Handling:
             }
 
             const totalIssues = filteredIssues.length;
+            if (totalIssues === 0) {
+                return {
+                    content: [{ type: "text", text: "No issues found for the selected filters." }],
+                };
+            }
+
             const cappedIssues = filteredIssues.slice(0, max_issues);
 
             // Load ruleset to get rule descriptions (for fix guidance)
@@ -389,41 +408,42 @@ Error Handling:
                 debug(`Could not load rule descriptions: ${_e}`);
             }
 
-            // Collect unique violated rules with their descriptions
-            const violatedRules = new Map<string, { severity: string; description: string; count: number }>();
+            // Compact summary per rule: one guidance + occurrence count + sample lines
+            const violatedRules = new Map<string, { severity: string; guidance: string; count: number; lines: Set<number> }>();
             for (const issue of cappedIssues) {
                 const code = issue.code;
+                const issueDescription = normalizeGuidanceText(issue.description);
+                const ruleDescription = normalizeGuidanceText(ruleDescriptions[code]);
+                const issueMessage = normalizeGuidanceText(issue.message);
+                const guidance = issueDescription || ruleDescription || issueMessage || "No guidance available";
+                const line = issue.range.start.line + 1;
+
                 if (!violatedRules.has(code)) {
                     const severity = ["Error", "Warning", "Information", "Hint"][issue.severity] || "Unknown";
-                    const description = ruleDescriptions[code] || issue.message;
-                    violatedRules.set(code, { severity, description, count: 1 });
+                    violatedRules.set(code, { severity, guidance: compactGuidance(guidance), count: 1, lines: new Set([line]) });
                 } else {
-                    violatedRules.get(code)!.count++;
+                    const ruleInfo = violatedRules.get(code)!;
+                    ruleInfo.count++;
+                    if (ruleInfo.lines.size < MAX_LINE_SAMPLES_PER_RULE) {
+                        ruleInfo.lines.add(line);
+                    }
                 }
             }
 
-            // Formatting: deduplicated rules section + compact issues list
-            const header = `Found ${totalIssues} issues` +
-                (totalIssues > max_issues ? ` (showing first ${max_issues})` : "") +
-                `:`;
+            const header = `${totalIssues} issues` +
+                (totalIssues > max_issues ? ` (sampled first ${max_issues})` : "");
 
             const rulesSection = Array.from(violatedRules.entries())
-                .map(([code, info]) => `- ${code} [${info.severity}]: ${info.description}`)
+                .map(([code, info]) => {
+                    const lines = Array.from(info.lines).sort((a, b) => a - b);
+                    const linesLabel = lines.length > 0 ? ` @L${lines.join(",L")}` : "";
+                    return `- ${code} [${info.severity}] x${info.count}${linesLabel}: ${info.guidance}`;
+                })
                 .join("\n");
-
-            const issuesSection = cappedIssues.map((issue) => {
-                const line = issue.range.start.line + 1;
-                return `L${line}: ${issue.code}`;
-            }).join("\n");
 
             const resultText = [
                 header,
-                "",
-                "## Rules violated (with fix guidance):",
                 rulesSection,
-                "",
-                "## Locations:",
-                issuesSection,
             ].join("\n");
 
             return {
