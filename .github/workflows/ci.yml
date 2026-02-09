@@ -30,10 +30,11 @@ jobs:
 
       - name: Test MCP initialize
         run: |
-          RESPONSE=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}' | node build/index.js 2>/dev/null | head -1)
-          echo "$RESPONSE" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
+          (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'; sleep 2) | timeout 10 node build/index.js 2>/dev/null > /tmp/mcp_init.txt
+          python3 -c "
+          import json
+          with open('/tmp/mcp_init.txt') as f:
+              data = json.loads(f.readline())
           assert data['result']['serverInfo']['name'] == 'api-oas-checker', 'Wrong server name'
           assert data['result']['serverInfo']['version'] == '1.0.0', 'Wrong version'
           print('Initialize OK')
@@ -41,10 +42,12 @@ jobs:
 
       - name: Test MCP tools/list
         run: |
-          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | node build/index.js 2>/dev/null | tail -1)
-          echo "$RESPONSE" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
+          (printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'; sleep 2) | timeout 10 node build/index.js 2>/dev/null > /tmp/mcp_tools.txt
+          python3 -c "
+          import json
+          with open('/tmp/mcp_tools.txt') as f:
+              lines = f.readlines()
+          data = json.loads(lines[-1])
           tools = {t['name'] for t in data['result']['tools']}
           assert 'validate_openapi' in tools, 'Missing validate_openapi tool'
           assert 'list_rules' in tools, 'Missing list_rules tool'
@@ -66,10 +69,12 @@ jobs:
                   '200':
                     description: OK
           SPEC
-          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"validate_openapi","arguments":{"openapi_path":"/tmp/test-api.yaml","max_issues":5}}}\n' | node build/index.js 2>/dev/null | tail -1)
-          echo "$RESPONSE" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
+          (printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"validate_openapi","arguments":{"openapi_path":"/tmp/test-api.yaml","max_issues":5}}}\n'; sleep 5) | timeout 30 node build/index.js 2>/dev/null > /tmp/mcp_validate.txt
+          python3 -c "
+          import json
+          with open('/tmp/mcp_validate.txt') as f:
+              lines = f.readlines()
+          data = json.loads(lines[-1])
           text = data['result']['content'][0]['text']
           assert 'issues' in text.lower(), 'Expected issues in output'
           print('Validate OK')
@@ -78,10 +83,12 @@ jobs:
 
       - name: Test list_rules
         run: |
-          RESPONSE=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_rules","arguments":{"standard_ruleset":"spectral"}}}\n' | node build/index.js 2>/dev/null | tail -1)
-          echo "$RESPONSE" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
+          (printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_rules","arguments":{"standard_ruleset":"spectral"}}}\n'; sleep 5) | timeout 30 node build/index.js 2>/dev/null > /tmp/mcp_rules.txt
+          python3 -c "
+          import json
+          with open('/tmp/mcp_rules.txt') as f:
+              lines = f.readlines()
+          data = json.loads(lines[-1])
           rules = json.loads(data['result']['content'][0]['text'])
           assert len(rules) > 0, 'Expected at least one rule'
           print(f'List rules OK: {len(rules)} rules found')

@@ -1,15 +1,8 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-    CallToolRequestSchema,
-    ErrorCode,
-    ListToolsRequestSchema,
-    McpError,
-} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
@@ -26,21 +19,11 @@ function debug(msg: string) {
     if (DEBUG) console.error(`[DEBUG] ${msg}`);
 }
 
+const CHARACTER_LIMIT = 25000;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SPECTRAL_BIN = path.resolve(__dirname, "..", "node_modules", ".bin", "spectral");
-
-const server = new Server(
-    {
-        name: "api-oas-checker",
-        version: "1.0.0",
-    },
-    {
-        capabilities: {
-            tools: {},
-        },
-    }
-);
 
 const STANDARD_RULESETS: Record<string, string> = {
     "spectral": "https://github.com/italia/api-oas-checker-rules/releases/latest/download/spectral.yml",
@@ -49,282 +32,423 @@ const STANDARD_RULESETS: Record<string, string> = {
     "spectral-security": "https://github.com/italia/api-oas-checker-rules/releases/latest/download/spectral-security.yml",
 };
 
+const STANDARD_RULESET_NAMES = ["spectral", "spectral-full", "spectral-generic", "spectral-security"] as const;
+
+// --- TypeScript interfaces ---
+
+interface SpectralIssue {
+    code: string;
+    message: string;
+    path: string[];
+    severity: number;
+    range: {
+        start: { line: number; character: number };
+        end: { line: number; character: number };
+    };
+}
+
+interface ParsedRule {
+    code: string;
+    description: string;
+    severity: string;
+}
+
+interface RulesetData {
+    rules?: Record<string, { description?: string; message?: string; severity?: string }>;
+}
+
+// --- Zod schemas ---
+
 const ValidateOpenApiSchema = z.object({
-    openapi_path: z.string().optional(),
-    openapi_content: z.string().optional(),
-    filter_path: z.string().optional().describe("Filter results by JSON path (e.g. 'paths./users')"),
-    line_start: z.number().optional().describe("Filter results starting from this line (1-indexed)"),
-    line_end: z.number().optional().describe("Filter results up to this line (1-indexed)"),
-    max_issues: z.number().default(20).describe("Cap the number of returned issues"),
-    ruleset_path: z.string().optional().describe("URL or local path to a custom spectral ruleset file"),
-    standard_ruleset: z.enum(["spectral", "spectral-full", "spectral-generic", "spectral-security"]).optional().describe("Use a standard ruleset from the Italian guidelines."),
-    allowed_rules: z.array(z.string()).optional().describe("List of rule codes to verify. If omitted, all rules are checked."),
-});
+    openapi_path: z.string().optional()
+        .describe("Absolute path to a local OpenAPI file (YAML or JSON). Provide either this or openapi_content."),
+    openapi_content: z.string().optional()
+        .describe("Raw OpenAPI specification content (YAML or JSON string). Provide either this or openapi_path."),
+    filter_path: z.string().optional()
+        .describe("Filter results by JSON path substring (e.g. 'paths./users', 'info.contact'). Only issues whose path contains this string are returned."),
+    line_start: z.number().optional()
+        .describe("Filter results starting from this line number (1-indexed, inclusive)."),
+    line_end: z.number().optional()
+        .describe("Filter results up to this line number (1-indexed, inclusive)."),
+    max_issues: z.number().default(20)
+        .describe("Maximum number of issues to return. Default: 20."),
+    ruleset_path: z.string().optional()
+        .describe("URL or absolute local path to a custom Spectral ruleset file. Overrides standard_ruleset."),
+    standard_ruleset: z.enum(STANDARD_RULESET_NAMES).optional()
+        .describe("Standard Italian PA ruleset to use: 'spectral' (default, core rules), 'spectral-full' (all rules incl. security), 'spectral-generic' (generic API rules), 'spectral-security' (security-focused rules)."),
+    allowed_rules: z.array(z.string()).optional()
+        .describe("Whitelist of rule codes to check (e.g. ['has-contact', 'use-semver']). If omitted, all rules are checked."),
+}).strict();
 
 const ListRulesSchema = z.object({
-    ruleset_path: z.string().optional().describe("URL or local path to a spectral ruleset file"),
-    standard_ruleset: z.enum(["spectral", "spectral-full", "spectral-generic", "spectral-security"]).optional().describe("Use a standard ruleset from the Italian guidelines."),
+    ruleset_path: z.string().optional()
+        .describe("URL or absolute local path to a Spectral ruleset file. Overrides standard_ruleset."),
+    standard_ruleset: z.enum(STANDARD_RULESET_NAMES).optional()
+        .describe("Standard Italian PA ruleset: 'spectral' (default), 'spectral-full', 'spectral-generic', 'spectral-security'."),
+}).strict();
+
+// --- Shared helpers ---
+
+function resolveRulesetUrl(rulesetPath?: string, standardRuleset?: string): string {
+    if (rulesetPath) return rulesetPath;
+    if (standardRuleset) return STANDARD_RULESETS[standardRuleset];
+    return STANDARD_RULESETS["spectral"];
+}
+
+async function fetchRulesetContent(rulesetUrl: string): Promise<string> {
+    if (rulesetUrl.startsWith("http")) {
+        const response = await fetch(rulesetUrl);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch ruleset: ${response.statusText}`);
+        }
+        return response.text();
+    }
+    return fs.promises.readFile(rulesetUrl, "utf-8");
+}
+
+function parseRuleset(content: string): RulesetData {
+    return yaml.load(content) as RulesetData;
+}
+
+function extractRuleDescriptions(ruleset: RulesetData): Record<string, string> {
+    const descriptions: Record<string, string> = {};
+    if (ruleset?.rules) {
+        for (const [code, rule] of Object.entries(ruleset.rules)) {
+            const desc = rule.description || rule.message || "";
+            if (desc) descriptions[code] = desc;
+        }
+    }
+    return descriptions;
+}
+
+function truncateIfNeeded(text: string): string {
+    if (text.length > CHARACTER_LIMIT) {
+        return text.slice(0, CHARACTER_LIMIT) + "\n\n[Output truncated. Use filters (filter_path, line_start/line_end, allowed_rules) or reduce max_issues to get focused results.]";
+    }
+    return text;
+}
+
+// --- Server ---
+
+const server = new McpServer({
+    name: "api-oas-checker",
+    version: "1.0.0",
 });
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-        tools: [
-            {
-                name: "validate_openapi",
-                description: "Validate an OpenAPI specification using Italian PA guidelines (Spectral).",
-                inputSchema: zodToJsonSchema(ValidateOpenApiSchema),
-            },
-            {
-                name: "list_rules",
-                description: "List available rules from a Spectral ruleset.",
-                inputSchema: zodToJsonSchema(ListRulesSchema),
-            },
-        ],
-    };
-});
+// --- Tool: list_rules ---
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name === "list_rules") {
-        const args = ListRulesSchema.safeParse(request.params.arguments);
-        if (!args.success) {
-            throw new McpError(ErrorCode.InvalidParams, "Invalid arguments");
-        }
+server.registerTool(
+    "list_rules",
+    {
+        title: "List Spectral Rules",
+        description: `List available validation rules from an Italian PA Spectral ruleset.
 
-        let rulesetUrl = STANDARD_RULESETS["spectral"];
-        if (args.data.ruleset_path) {
-            rulesetUrl = args.data.ruleset_path;
-        } else if (args.data.standard_ruleset) {
-            rulesetUrl = STANDARD_RULESETS[args.data.standard_ruleset];
-        }
+Returns a JSON array of rule objects, each with code, description, and severity.
 
-        let rulesContent = "";
+Args:
+  - standard_ruleset (string, optional): One of 'spectral', 'spectral-full', 'spectral-generic', 'spectral-security'. Default: 'spectral'.
+  - ruleset_path (string, optional): URL or local path to a custom ruleset. Overrides standard_ruleset.
 
+Returns:
+  JSON array of objects:
+  [
+    {
+      "code": "has-contact",
+      "description": "API MUST reference a contact...",
+      "severity": "error"
+    }
+  ]
+
+Examples:
+  - List core Italian PA rules: { "standard_ruleset": "spectral" }
+  - List security rules: { "standard_ruleset": "spectral-security" }
+  - Use a custom ruleset: { "ruleset_path": "https://example.com/my-rules.yml" }
+
+Error Handling:
+  - Returns an error if the ruleset URL is unreachable or the YAML is invalid.`,
+        inputSchema: ListRulesSchema,
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true,
+        },
+    },
+    async ({ ruleset_path, standard_ruleset }) => {
         try {
-            if (rulesetUrl.startsWith("http")) {
-                const response = await fetch(rulesetUrl);
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch ruleset: ${response.statusText}`);
-                }
-                rulesContent = await response.text();
-            } else {
-                rulesContent = await fs.promises.readFile(rulesetUrl, "utf-8");
-            }
+            const rulesetUrl = resolveRulesetUrl(ruleset_path, standard_ruleset);
+            const rulesContent = await fetchRulesetContent(rulesetUrl);
+            const ruleset = parseRuleset(rulesContent);
 
-            const ruleset = yaml.load(rulesContent) as any;
-            if (!ruleset || !ruleset.rules) {
+            if (!ruleset?.rules) {
                 return {
                     content: [{ type: "text", text: "No rules found in the provided ruleset." }],
                 };
             }
 
-            const rules = Object.entries(ruleset.rules).map(([code, rule]: [string, any]) => {
-                return {
-                    code,
-                    description: rule.description || rule.message || "No description",
-                    severity: rule.severity || "unknown",
-                };
-            });
+            const rules: ParsedRule[] = Object.entries(ruleset.rules).map(([code, rule]) => ({
+                code,
+                description: rule.description || rule.message || "No description",
+                severity: rule.severity || "unknown",
+            }));
 
             return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(rules, null, 2),
-                    },
-                ],
+                content: [{ type: "text", text: JSON.stringify(rules, null, 2) }],
             };
-
-        } catch (error: any) {
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
             return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error fetching or parsing ruleset: ${error.message}`,
-                    },
-                ],
+                content: [{ type: "text", text: `Error fetching or parsing ruleset: ${message}` }],
                 isError: true,
             };
         }
     }
+);
 
-    if (request.params.name !== "validate_openapi") {
-        throw new McpError(ErrorCode.MethodNotFound, "Unknown tool");
-    }
+// --- Tool: validate_openapi ---
 
-    const args = ValidateOpenApiSchema.safeParse(request.params.arguments);
-    if (!args.success) {
-        throw new McpError(ErrorCode.InvalidParams, "Invalid arguments");
-    }
+server.registerTool(
+    "validate_openapi",
+    {
+        title: "Validate OpenAPI Specification",
+        description: `Validate an OpenAPI specification (OAS3) against Italian Public Administration guidelines using Spectral.
 
-    const { openapi_path, openapi_content, filter_path, line_start, line_end, max_issues, ruleset_path, allowed_rules, standard_ruleset } = args.data;
+Runs the official Italian PA linting rules on the provided OpenAPI document and returns a structured report of issues found, grouped by rule with fix guidance.
 
-    if (!openapi_path && !openapi_content) {
-        throw new McpError(ErrorCode.InvalidParams, "Must provide either openapi_path or openapi_content");
-    }
+Args:
+  - openapi_path (string, optional): Absolute path to a local OpenAPI file (YAML/JSON). Mutually exclusive with openapi_content.
+  - openapi_content (string, optional): Raw OpenAPI content as a string. Mutually exclusive with openapi_path.
+  - standard_ruleset (string, optional): Ruleset to use: 'spectral' (default, core), 'spectral-full' (all+security), 'spectral-generic' (generic API), 'spectral-security' (security).
+  - ruleset_path (string, optional): URL or local path to a custom Spectral ruleset. Overrides standard_ruleset.
+  - allowed_rules (string[], optional): Only check these rule codes (e.g. ['has-contact', 'use-semver']). If omitted, all rules.
+  - filter_path (string, optional): Only show issues whose JSON path contains this string (e.g. 'paths./users').
+  - line_start (number, optional): Only show issues on or after this line (1-indexed).
+  - line_end (number, optional): Only show issues on or before this line (1-indexed).
+  - max_issues (number, optional): Cap the number of issues returned. Default: 20.
 
-    let filePathToLint = openapi_path;
-    let cleanUpFile = false;
+Returns:
+  A text report with two sections:
+  1. "Rules violated (with fix guidance)" — each violated rule listed once with severity and description.
+  2. "Locations" — compact list of line numbers and rule codes.
 
-    try {
-        if (openapi_content) {
-            const tempDir = os.tmpdir();
-            const tempFile = path.join(tempDir, `temp_openapi_${crypto.randomUUID()}.yaml`);
-            await fs.promises.writeFile(tempFile, openapi_content);
-            filePathToLint = tempFile;
-            cleanUpFile = true;
-        } else if (!filePathToLint) {
-            throw new Error("Unexpected state");
+  Example output:
+  Found 3 issues:
+
+  ## Rules violated (with fix guidance):
+  - has-contact [Error]: API MUST reference a contact...
+  - use-semver [Error]: The API version field should follow semver.
+
+  ## Locations:
+  L2: has-contact
+  L2: use-semver
+  L5: has-contact
+
+Examples:
+  - Validate a local file: { "openapi_path": "/home/user/api.yaml" }
+  - Validate pasted content: { "openapi_content": "openapi: 3.0.3\\ninfo:..." }
+  - Check only security rules: { "openapi_path": "/home/user/api.yaml", "standard_ruleset": "spectral-security" }
+  - Focus on a specific path: { "openapi_path": "/home/user/api.yaml", "filter_path": "paths./users" }
+
+Error Handling:
+  - Returns error if neither openapi_path nor openapi_content is provided.
+  - Returns error if Spectral binary is not found or fails to execute.
+  - Returns error if the ruleset cannot be fetched or parsed.`,
+        inputSchema: ValidateOpenApiSchema,
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true,
+        },
+    },
+    async ({ openapi_path, openapi_content, filter_path, line_start, line_end, max_issues, ruleset_path, allowed_rules, standard_ruleset }) => {
+        if (!openapi_path && !openapi_content) {
+            return {
+                content: [{ type: "text", text: "Error: Must provide either openapi_path or openapi_content." }],
+                isError: true,
+            };
         }
 
-        // Ruleset URL
-        let rulesetUrl = STANDARD_RULESETS["spectral"];
-        if (ruleset_path) {
-            rulesetUrl = ruleset_path;
-        } else if (standard_ruleset) {
-            rulesetUrl = STANDARD_RULESETS[standard_ruleset];
-        }
+        let filePathToLint = openapi_path;
+        let cleanUpFile = false;
 
-        // Fix for spectral-security and spectral-full which depend on checkSecurity.js
-        // The release/download content expects functions/checkSecurity.js relative path, but it's not in the release.
-        // We download the ruleset and the function locally to make it work.
-        if (rulesetUrl === STANDARD_RULESETS["spectral-security"] || rulesetUrl === STANDARD_RULESETS["spectral-full"]) {
-            debug(`Fix ruleset for ${standard_ruleset}`);
-            const cacheDir = path.join(os.tmpdir(), "mcp-api-oas-checker-cache");
-            if (!fs.existsSync(cacheDir)) {
-                await fs.promises.mkdir(cacheDir, { recursive: true, mode: 0o700 });
+        try {
+            if (openapi_content) {
+                const tempDir = os.tmpdir();
+                const tempFile = path.join(tempDir, `temp_openapi_${crypto.randomUUID()}.yaml`);
+                await fs.promises.writeFile(tempFile, openapi_content);
+                filePathToLint = tempFile;
+                cleanUpFile = true;
+            } else if (!filePathToLint) {
+                throw new Error("Unexpected state: no file path and no content.");
             }
-            if (!fs.existsSync(path.join(cacheDir, "functions"))) {
+
+            let rulesetUrl = resolveRulesetUrl(ruleset_path, standard_ruleset);
+
+            // Fix for spectral-security and spectral-full which depend on checkSecurity.js
+            if (rulesetUrl === STANDARD_RULESETS["spectral-security"] || rulesetUrl === STANDARD_RULESETS["spectral-full"]) {
+                debug(`Fix ruleset for ${standard_ruleset}`);
+                const cacheDir = path.join(os.tmpdir(), "mcp-api-oas-checker-cache");
                 await fs.promises.mkdir(path.join(cacheDir, "functions"), { recursive: true, mode: 0o700 });
+
+                const ruleFilename = path.basename(rulesetUrl);
+                const localRulesetPath = path.join(cacheDir, ruleFilename);
+                const localFunctionPath = path.join(cacheDir, "functions", "checkSecurity.js");
+
+                if (!fs.existsSync(localRulesetPath)) {
+                    debug(`Downloading ruleset from ${rulesetUrl} to ${localRulesetPath}`);
+                    const rulesetResp = await fetch(rulesetUrl);
+                    if (!rulesetResp.ok) throw new Error(`Failed to download ruleset: ${rulesetResp.statusText}`);
+                    const rulesetContent = await rulesetResp.text();
+                    await fs.promises.writeFile(localRulesetPath, rulesetContent);
+                } else {
+                    debug(`Using cached ruleset at ${localRulesetPath}`);
+                }
+
+                if (!fs.existsSync(localFunctionPath)) {
+                    debug(`Downloading checkSecurity.js to ${localFunctionPath}`);
+                    const functionUrl = "https://raw.githubusercontent.com/italia/api-oas-checker-rules/refs/heads/main/security/functions/checkSecurity.js";
+                    const funcResp = await fetch(functionUrl);
+                    if (!funcResp.ok) throw new Error(`Failed to download checkSecurity.js: ${funcResp.statusText}`);
+                    const funcContent = await funcResp.text();
+                    await fs.promises.writeFile(localFunctionPath, funcContent);
+                } else {
+                    debug(`Using cached checkSecurity.js`);
+                }
+
+                rulesetUrl = localRulesetPath;
+                debug(`Ruleset fixed at ${rulesetUrl}`);
             }
 
-            const ruleFilename = path.basename(rulesetUrl);
-            const localRulesetPath = path.join(cacheDir, ruleFilename);
-            const localFunctionPath = path.join(cacheDir, "functions", "checkSecurity.js");
+            // Run Spectral via execFile (no shell interpolation — prevents command injection)
+            debug(`Running Spectral on ${filePathToLint} with ruleset ${rulesetUrl}`);
+            const spectralArgs = ["lint", filePathToLint!, "-r", rulesetUrl, "-f", "json", "--quiet"];
 
-            if (!fs.existsSync(localRulesetPath)) {
-                debug(`Downloading ruleset from ${rulesetUrl} to ${localRulesetPath}`);
-                const rulesetResp = await fetch(rulesetUrl);
-                if (!rulesetResp.ok) throw new Error(`Failed to download ruleset: ${rulesetResp.statusText}`);
-                const rulesetContent = await rulesetResp.text();
-                await fs.promises.writeFile(localRulesetPath, rulesetContent);
-            } else {
-                debug(`Using cached ruleset at ${localRulesetPath}`);
-            }
-
-            if (!fs.existsSync(localFunctionPath)) {
-                debug(`Downloading checkSecurity.js to ${localFunctionPath}`);
-                const functionUrl = "https://raw.githubusercontent.com/italia/api-oas-checker-rules/refs/heads/main/security/functions/checkSecurity.js";
-                const funcResp = await fetch(functionUrl);
-                if (!funcResp.ok) throw new Error(`Failed to download checkSecurity.js: ${funcResp.statusText}`);
-                const funcContent = await funcResp.text();
-                await fs.promises.writeFile(localFunctionPath, funcContent);
-            } else {
-                debug(`Using cached checkSecurity.js`);
-            }
-
-            rulesetUrl = localRulesetPath;
-            debug(`Ruleset fixed at ${rulesetUrl}`);
-        }
-
-        // Run Spectral via execFile (no shell interpolation — prevents command injection)
-        debug(`Running Spectral on ${filePathToLint} with ruleset ${rulesetUrl}`);
-        const spectralArgs = ["lint", filePathToLint!, "-r", rulesetUrl, "-f", "json", "--quiet"];
-
-        let stdout = "";
-        try {
-            const result = await execFilePromise(SPECTRAL_BIN, spectralArgs, { maxBuffer: 1024 * 1024 * 10 });
-            stdout = result.stdout;
-        } catch (e: any) {
-            // Spectral returns exit code 1 if issues are found, but stdout still contains the JSON
-            if (e.stdout) {
-                stdout = e.stdout;
-            } else {
-                throw new Error(`Spectral failed: ${e.stderr || e.message}`);
-            }
-        }
-
-        if (!stdout) {
-            return {
-                content: [{ type: "text", text: "No issues found or empty output." }],
-            };
-        }
-
-        let issues: any[] = [];
-        try {
-            issues = JSON.parse(stdout);
-        } catch (e) {
-            return {
-                content: [{ type: "text", text: `Failed to parse Spectral JSON output: ${stdout.slice(0, 200)}...` }],
-            };
-        }
-
-        // Filtering
-        let filteredIssues = issues;
-
-        if (allowed_rules && allowed_rules.length > 0) {
-            filteredIssues = filteredIssues.filter(issue => allowed_rules.includes(issue.code));
-        }
-
-        if (filter_path) {
-            filteredIssues = filteredIssues.filter(issue => {
-                const pathStr = issue.path.join(".");
-                return pathStr.includes(filter_path);
-            });
-        }
-
-        if (line_start !== undefined) {
-            filteredIssues = filteredIssues.filter(issue => issue.range.start.line + 1 >= line_start);
-        }
-
-        if (line_end !== undefined) {
-            filteredIssues = filteredIssues.filter(issue => issue.range.start.line + 1 <= line_end);
-        }
-
-        const totalIssues = filteredIssues.length;
-        const cappedIssues = filteredIssues.slice(0, max_issues);
-
-        // Formatting
-        const header = `Found ${totalIssues} issues` +
-            (totalIssues > max_issues ? ` (showing first ${max_issues})` : "") +
-            `:`;
-
-        const lines = cappedIssues.map((issue: any) => {
-            const line = issue.range.start.line + 1;
-            const severity = ["Error", "Warning", "Information", "Hint"][issue.severity] || "Unknown";
-            return `Line ${line}: [${severity}] ${issue.message} (${issue.code})`;
-        });
-
-        const resultText = [header, ...lines].join("\n");
-
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: resultText,
-                },
-            ],
-        };
-
-    } catch (error: any) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error executing spectral: ${error.message}`,
-                },
-            ],
-            isError: true,
-        };
-    } finally {
-        if (cleanUpFile && filePathToLint) {
+            let stdout = "";
             try {
-                await fs.promises.unlink(filePathToLint);
-            } catch (e) {
-                // ignore
+                const result = await execFilePromise(SPECTRAL_BIN, spectralArgs, { maxBuffer: 1024 * 1024 * 10 });
+                stdout = result.stdout;
+            } catch (e: unknown) {
+                // Spectral returns exit code 1 if issues are found, but stdout still contains the JSON
+                const execError = e as { stdout?: string; stderr?: string; message?: string };
+                if (execError.stdout) {
+                    stdout = execError.stdout;
+                } else {
+                    throw new Error(`Spectral failed: ${execError.stderr || execError.message}`);
+                }
+            }
+
+            if (!stdout) {
+                return {
+                    content: [{ type: "text", text: "No issues found. The OpenAPI specification passes all checked rules." }],
+                };
+            }
+
+            let issues: SpectralIssue[];
+            try {
+                issues = JSON.parse(stdout);
+            } catch (_e) {
+                return {
+                    content: [{ type: "text", text: `Failed to parse Spectral JSON output: ${stdout.slice(0, 200)}...` }],
+                    isError: true,
+                };
+            }
+
+            // Filtering
+            let filteredIssues = issues;
+
+            if (allowed_rules && allowed_rules.length > 0) {
+                filteredIssues = filteredIssues.filter(issue => allowed_rules.includes(issue.code));
+            }
+
+            if (filter_path) {
+                filteredIssues = filteredIssues.filter(issue => {
+                    const pathStr = issue.path.join(".");
+                    return pathStr.includes(filter_path);
+                });
+            }
+
+            if (line_start !== undefined) {
+                filteredIssues = filteredIssues.filter(issue => issue.range.start.line + 1 >= line_start);
+            }
+
+            if (line_end !== undefined) {
+                filteredIssues = filteredIssues.filter(issue => issue.range.start.line + 1 <= line_end);
+            }
+
+            const totalIssues = filteredIssues.length;
+            const cappedIssues = filteredIssues.slice(0, max_issues);
+
+            // Load ruleset to get rule descriptions (for fix guidance)
+            let ruleDescriptions: Record<string, string> = {};
+            try {
+                const rulesContent = await fetchRulesetContent(rulesetUrl);
+                const ruleset = parseRuleset(rulesContent);
+                ruleDescriptions = extractRuleDescriptions(ruleset);
+            } catch (_e) {
+                debug(`Could not load rule descriptions: ${_e}`);
+            }
+
+            // Collect unique violated rules with their descriptions
+            const violatedRules = new Map<string, { severity: string; description: string; count: number }>();
+            for (const issue of cappedIssues) {
+                const code = issue.code;
+                if (!violatedRules.has(code)) {
+                    const severity = ["Error", "Warning", "Information", "Hint"][issue.severity] || "Unknown";
+                    const description = ruleDescriptions[code] || issue.message;
+                    violatedRules.set(code, { severity, description, count: 1 });
+                } else {
+                    violatedRules.get(code)!.count++;
+                }
+            }
+
+            // Formatting: deduplicated rules section + compact issues list
+            const header = `Found ${totalIssues} issues` +
+                (totalIssues > max_issues ? ` (showing first ${max_issues})` : "") +
+                `:`;
+
+            const rulesSection = Array.from(violatedRules.entries())
+                .map(([code, info]) => `- ${code} [${info.severity}]: ${info.description}`)
+                .join("\n");
+
+            const issuesSection = cappedIssues.map((issue) => {
+                const line = issue.range.start.line + 1;
+                return `L${line}: ${issue.code}`;
+            }).join("\n");
+
+            const resultText = [
+                header,
+                "",
+                "## Rules violated (with fix guidance):",
+                rulesSection,
+                "",
+                "## Locations:",
+                issuesSection,
+            ].join("\n");
+
+            return {
+                content: [{ type: "text", text: truncateIfNeeded(resultText) }],
+            };
+
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+                content: [{ type: "text", text: `Error executing spectral: ${message}` }],
+                isError: true,
+            };
+        } finally {
+            if (cleanUpFile && filePathToLint) {
+                try {
+                    await fs.promises.unlink(filePathToLint);
+                } catch (_e) {
+                    // ignore
+                }
             }
         }
     }
-});
+);
+
+// --- Start server ---
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
