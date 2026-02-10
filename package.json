@@ -19,7 +19,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "@stoplight/spectral-cli": "^6.11.0",
     "js-yaml": "^4.1.1",
     "zod": "^3.22.4"
