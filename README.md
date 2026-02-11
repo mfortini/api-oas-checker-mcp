@@ -1,8 +1,7 @@
 # MCP API OAS Checker
 
-![Release](https://img.shields.io/github/v/release/mfortini/api-oas-checker-mcp?style=flat-square)
-![License](https://img.shields.io/github/license/mfortini/api-oas-checker-mcp?style=flat-square)
-![Issues](https://img.shields.io/github/issues/mfortini/api-oas-checker-mcp?style=flat-square)
+![License](https://img.shields.io/github/license/italia/api-oas-checker-mcp?style=flat-square)
+![Issues](https://img.shields.io/github/issues/italia/api-oas-checker-mcp?style=flat-square)
 
 A Model Context Protocol (MCP) server that validates OpenAPI specifications (OAS3) using the official [Italian Public Administration Guidelines](https://github.com/italia/api-oas-checker-rules).
 
@@ -27,13 +26,13 @@ It wraps the [api-oas-checker](https://github.com/italia/api-oas-checker-rules) 
 You can run the server directly using `npx` without cloning the repository manually:
 
 ```bash
-npx -y github:mfortini/api-oas-checker-mcp
+npx -y github:italia/api-oas-checker-mcp
 ```
 
 Or install it globally via `npm`:
 
 ```bash
-npm install -g git+https://github.com/mfortini/api-oas-checker-mcp.git
+npm install -g git+https://github.com/italia/api-oas-checker-mcp.git
 ```
 
 Then you can run `api-oas-checker-mcp` directly.
@@ -43,7 +42,7 @@ Or add it to your configuration (see Configuration section).
 ### Option 2: Build from Source
 
 ```bash
-git clone https://github.com/mfortini/api-oas-checker-mcp.git
+git clone https://github.com/italia/api-oas-checker-mcp.git
 cd api-oas-checker-mcp
 npm install
 ```
@@ -69,7 +68,7 @@ Add the server to your `claude_desktop_config.json`:
       "command": "npx",
       "args": [
         "-y",
-        "github:mfortini/api-oas-checker-mcp"
+        "github:italia/api-oas-checker-mcp"
       ]
     }
   }
