@@ -38,3 +38,5 @@ localisation:
   availableLanguages:
     - it
     - en
+organisation:
+  uri: urn:x-italian-pa:pcm
